@@ -13,6 +13,7 @@ from scanner_app.scanner import DemoScanner, FolderScanner
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="scanner_app", description="Scan old photos quickly.")
     ap.add_argument("--output", help="folder to save scans in (remembered for next time)")
+    ap.add_argument("--sorted", help="folder for finished photos, one subfolder per year (remembered)")
     src = ap.add_mutually_exclusive_group()
     src.add_argument("--demo", action="store_true", help="use fake scans instead of a scanner")
     src.add_argument("--from-folder", metavar="DIR",
@@ -24,6 +25,8 @@ def main(argv=None):
     settings = QSettings("image-scanner", "image-scanner")
     folder = args.output or settings.value("output_folder") or str(Path.home() / "Pictures" / "Scans")
     settings.setValue("output_folder", folder)
+    if args.sorted:
+        settings.setValue("sorted_folder", args.sorted)
 
     scanner = None
     if args.demo:
@@ -31,7 +34,7 @@ def main(argv=None):
     elif args.from_folder:
         scanner = FolderScanner(args.from_folder)
 
-    win = MainWindow(Library(folder), scanner)
+    win = MainWindow(Library(folder, settings.value("sorted_folder") or None), scanner)
     win.show()
     return app.exec()
 

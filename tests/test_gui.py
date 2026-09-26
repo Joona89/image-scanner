@@ -82,3 +82,62 @@ def test_filter_untagged(win):
     win.library.add_tag([win.grid.item(0).data(Qt.UserRole)], "x")
     win.filter_edit.setText("untagged")
     assert sum(not win.grid.item(i).isHidden() for i in range(win.grid.count())) == 3
+
+
+def test_year_then_done_moves_photos_to_year_folder(win):
+    QTest.keyClick(win.grid, Qt.Key_F5)
+    wait_scan(win)
+    batch = win.selected_ids()
+    assert len(batch) == 4
+
+    # Done without a year: nothing is saved and the photos stay selected.
+    QTest.keyClick(win.grid, Qt.Key_D)
+    assert not any(win.library.photos[i].done for i in batch)
+    assert sorted(win.selected_ids()) == sorted(batch)
+
+    QTest.keyClick(win.grid, Qt.Key_Y)
+    assert win.year_edit.hasFocus()
+    QTest.keyClicks(win.year_edit, "87")
+    QTest.keyClick(win.year_edit, Qt.Key_Return)
+    assert all(win.library.photos[i].year == 1987 for i in batch)
+
+    QTest.keyClick(win.grid, Qt.Key_D)
+    assert all(win.library.photos[i].done for i in batch)
+    assert len(list((win.library.sorted_folder / "1987").glob("*.jpg"))) == 4
+    # They leave the to-do view.
+    assert all(win.grid.item(i).isHidden() for i in range(win.grid.count()))
+    win.view_combo.setCurrentIndex(1)
+    assert not any(win.grid.item(i).isHidden() for i in range(win.grid.count()))
+
+
+def test_year_for_new_scans_and_450_dpi(win):
+    assert win.dpi_combo.findData(450) >= 0
+    win.dpi_combo.setCurrentIndex(win.dpi_combo.findData(450))
+    win.new_year_edit.setText("1992")
+    QTest.keyClick(win.grid, Qt.Key_F5)
+    wait_scan(win)
+    photos = [win.library.photos[i] for i in win.selected_ids()]
+    assert photos and all(p.year == 1992 and p.dpi == 450 for p in photos)
+
+
+def test_progress_bar(win, tmp_path):
+    from scanner_app.synthetic import DEMO_LAYOUTS, make_scan
+    import cv2
+    from scanner_app.scanner import FolderScanner
+
+    QTest.keyClick(win.grid, Qt.Key_F5)
+    assert win.progress_bar.isVisible() and win.progress_bar.maximum() == 100
+    wait_scan(win)
+    assert not win.progress_bar.isVisible()
+
+    # A scanner without progress reports: busy first, then an estimate.
+    src = tmp_path / "src"
+    src.mkdir()
+    cv2.imwrite(str(src / "a.png"), make_scan(DEMO_LAYOUTS[1]))
+    win.scanner = FolderScanner(src)
+    QTest.keyClick(win.grid, Qt.Key_F5)
+    assert win.progress_bar.maximum() == 0
+    wait_scan(win)
+    QTest.keyClick(win.grid, Qt.Key_F5)
+    assert win.progress_bar.maximum() == 100 and "estimate" in win.progress_bar.format()
+    wait_scan(win)
