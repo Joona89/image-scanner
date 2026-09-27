@@ -42,12 +42,19 @@ class Photo:
     created: str
     tags: list[str] = field(default_factory=list)
     year: int | None = None  # None = not set yet, 0 = explicitly unknown
+    month: int | None = None
+    day: int | None = None
+    caption: str = ""
     dpi: int | None = None
     exported: str | None = None  # absolute path of the sorted copy once done
 
     @property
     def done(self) -> bool:
         return self.exported is not None
+
+    @property
+    def date(self) -> tuple[int | None, int | None, int | None]:
+        return (self.year, self.month, self.day)
 
 
 def parse_year(text: str) -> int | None:
@@ -62,10 +69,54 @@ def parse_year(text: str) -> int | None:
     return None
 
 
+def parse_date(text: str) -> tuple[int, int | None, int | None] | None:
+    """A year with optional month and day, as (year, month, day).
+
+    Accepts 1985, 85, 1985-06, 1985-06-14, 6.1985 and 14.6.1985.
+    '?' means unknown: (0, None, None). None if the text is not a date.
+    """
+    t = text.strip()
+    if "-" in t:
+        parts = t.split("-")
+        y, rest = parts[0], parts[1:]
+    elif "." in t or "/" in t:
+        parts = t.replace("/", ".").split(".")
+        y, rest = parts[-1], list(reversed(parts[:-1]))
+    else:
+        y, rest = t, []
+    year = parse_year(y)
+    if year is None or len(rest) > 2 or not all(r.isdigit() for r in rest):
+        return None
+    if year == UNKNOWN_YEAR:
+        return (UNKNOWN_YEAR, None, None) if not rest else None
+    month = int(rest[0]) if rest else None
+    day = int(rest[1]) if len(rest) > 1 else None
+    if month is not None and not 1 <= month <= 12:
+        return None
+    if day is not None:
+        try:
+            datetime(year, month, day)
+        except ValueError:
+            return None
+    return (year, month, day)
+
+
 def year_label(year: int | None) -> str:
     if year is None:
         return "no year"
     return "Unknown year" if year == UNKNOWN_YEAR else str(year)
+
+
+def date_label(year: int | None, month: int | None = None, day: int | None = None) -> str:
+    """'1985', '1985-06', '1985-06-14', 'no year' or 'Unknown year'."""
+    if not year:
+        return year_label(year)
+    out = f"{year:04d}"
+    if month:
+        out += f"-{month:02d}"
+        if day:
+            out += f"-{day:02d}"
+    return out
 
 
 def _imwrite(path: Path, img: np.ndarray, params=()) -> None:
@@ -182,15 +233,24 @@ class Library:
         return True
 
     def set_year(self, ids, year: int | None) -> None:
-        self._change(ids, lambda p: setattr(p, "year", year))
+        self.set_date(ids, (year, None, None))
+
+    def set_date(self, ids, date: tuple[int | None, int | None, int | None]) -> None:
+        def apply(p):
+            p.year, p.month, p.day = date
+        self._change(ids, apply)
+
+    def set_caption(self, ids, caption: str) -> None:
+        caption = caption.strip()
+        self._change(ids, lambda p: setattr(p, "caption", caption))
 
     def _change(self, ids, fn) -> None:
         with self._lock:
             for i in ids:
                 p = self.photos[i]
-                before = (list(p.tags), p.year)
+                before = (list(p.tags), p.date, p.caption)
                 fn(p)
-                if (p.tags, p.year) != before:
+                if (p.tags, p.date, p.caption) != before:
                     self._write_metadata(p)
                     if p.done:
                         self._export(p)
@@ -198,14 +258,15 @@ class Library:
 
     def _write_metadata(self, photo: Photo) -> None:
         path = self.folder / photo.file
-        year = photo.year or None  # unknown (0) gets no date
-        path.write_bytes(write_metadata(path.read_bytes(), photo.tags, year, photo.dpi))
+        date = photo.date if photo.year else None  # unknown (0) gets no date
+        path.write_bytes(write_metadata(path.read_bytes(), photo.tags, date, photo.dpi,
+                                        caption=photo.caption, scanned=photo.created))
 
     # -- done / sorted output --
 
     def sorted_path(self, photo: Photo) -> Path:
         folder = self.sorted_folder / year_label(photo.year)
-        prefix = f"{photo.year}_" if photo.year else ""
+        prefix = f"{date_label(*photo.date)}_" if photo.year else ""
         return folder / f"{prefix}{photo.id}.jpg"
 
     def _export(self, photo: Photo) -> None:

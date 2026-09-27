@@ -141,3 +141,55 @@ def test_progress_bar(win, tmp_path):
     QTest.keyClick(win.grid, Qt.Key_F5)
     assert win.progress_bar.maximum() == 100 and "estimate" in win.progress_bar.format()
     wait_scan(win)
+
+
+def test_done_button_uses_typed_date_and_caption(win):
+    QTest.keyClick(win.grid, Qt.Key_F5)
+    wait_scan(win)
+    batch = win.selected_ids()
+
+    # Type a date and caption but press the Done button instead of Enter.
+    QTest.keyClick(win.grid, Qt.Key_Y)
+    QTest.keyClicks(win.year_edit, "14.6.1985")
+    win._focus_caption_edit()
+    QTest.keyClicks(win.caption_edit, "Juhannus")
+    QTest.mouseClick(win.done_button, Qt.LeftButton)
+
+    for i in batch:
+        p = win.library.photos[i]
+        assert p.date == (1985, 6, 14) and p.caption == "Juhannus" and p.done
+    assert len(list((win.library.sorted_folder / "1985").glob("1985-06-14_*.jpg"))) == 4
+
+
+def test_fields_show_selection_values(win):
+    QTest.keyClick(win.grid, Qt.Key_F5)
+    wait_scan(win)
+    ids = win.selected_ids()
+    win.library.set_date(ids[:1], (1990, 5, None))
+    win.library.set_caption(ids[:1], "x")
+    win.grid.clearSelection()
+    win.grid.item(0).setSelected(True)
+    assert win.year_edit.text() == "1990-05" and win.caption_edit.text() == "x"
+    # Mixed selection: blank, and Done does not overwrite anything with blanks.
+    for i in range(win.grid.count()):
+        win.grid.item(i).setSelected(True)
+    assert win.year_edit.text() == "" and win.caption_edit.text() == ""
+    win.library.set_year(ids[1:], 1991)
+    win.grid.setFocus()
+    QTest.keyClick(win.grid, Qt.Key_D)
+    assert win.library.photos[ids[0]].date == (1990, 5, None)
+    assert win.library.photos[ids[0]].caption == "x"
+
+
+def test_more_dpi_choices_and_rotate_refreshes_preview(win):
+    for dpi in (75, 200, 400, 450, 800, 2400):
+        assert win.dpi_combo.findData(dpi) >= 0
+    QTest.keyClick(win.grid, Qt.Key_F5)
+    wait_scan(win)
+    win.grid.clearSelection()
+    win.grid.setCurrentItem(win.grid.item(0))
+    before = win.preview.pixmap().size()
+    QTest.keyClick(win.grid, Qt.Key_R)
+    after = win.preview.pixmap().size()
+    # The preview now shows the rotated photo (portrait instead of landscape).
+    assert (before.width() > before.height()) != (after.width() > after.height())
