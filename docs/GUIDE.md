@@ -5,7 +5,7 @@ A walk-through of a typical session, from a shoebox of prints to a folder per ye
 ## Before you start
 
 1. **Set the folders once.** In the toolbar, **Sorted folder…** is where finished photos go. Point it at your PhotoPrism originals folder, or anywhere you like. **Scan folder…** holds the raw scans and the to-do list; the default `Pictures\Scans` is fine.
-2. **Pick the resolution.** 300 dpi is plenty for viewing on screens, and 450 or 600 dpi if you might print enlargements. Higher is slower.
+2. **Pick the resolution.** 300 dpi is plenty for viewing on screens, and 450 or 600 dpi if you might print enlargements. Use 1200 or more for very small prints. Higher is slower.
 3. **Clean the glass.** Dust shows up on every scan, and the auto-crop can mistake big specks for tiny photos.
 
 ## The scanning loop
@@ -15,7 +15,7 @@ The app is built around one rhythm: **scan, and while it scans, finish the previ
 ```mermaid
 flowchart LR
     A[Lay prints on the glass] --> B[Space: scan]
-    B --> C[While it scans:<br>Y year, 1-9 tags, D done<br>on the previous batch]
+    B --> C[While it scans:<br>Y date, 1-9 tags, D done<br>on the previous batch]
     C --> D[Scan finishes:<br>new photos are selected]
     D --> A
 ```
@@ -36,11 +36,12 @@ When it finishes, the new photos appear in the **To do** list, already cut out. 
 
 Take the scanned prints off, put the next ones on, and press **Space** again. Then deal with the photos from the scan that just finished.
 
-### 4. Give them a year
+### 4. Give them a date
 
-With the photos selected, press **Y**, type the year and press Enter.
+With the photos selected, press **Y**, type the date and press Enter (or just click **Done**, which uses what you typed).
 
-- `1985` or just `85` both mean 1985.
+- `1985` or just `85` both mean 1985. The year is all that's required.
+- Know more? `6.1985` is June 1985 and `14.6.1985` (or `1985-06-14`) is the exact day.
 - `?` means you don't know. The photo goes to an *Unknown year* folder.
 
 Different years in one scan? Click one photo, press Y, then click the next. Shift-click and Ctrl-click select several at once.
@@ -55,9 +56,13 @@ Different years in one scan? Click one photo, press Y, then click the next. Shif
 
 Tags are optional. The year is not.
 
-### 6. Press D
+### 6. Add a caption (optional)
 
-The selected photos are written to `Sorted\<year>\` with the year and tags embedded, and they disappear from the to-do list.
+Press **C**, type a caption such as `Mummo's 60th birthday, Tampere` and press Enter. It is saved as the photo's description, which PhotoPrism shows under the photo. A good place for whatever is written on the back of the print.
+
+### 7. Press D
+
+The selected photos are written to `Sorted\<year>\` with the date, tags and caption embedded, and they disappear from the to-do list.
 
 If some of them still have no year, those stay in the list and stay selected: press **Y**, type the year, then **D** again.
 
@@ -70,7 +75,7 @@ Space, swap, Y, tags, D. After a few rounds it becomes one fluid motion, and the
 | Problem | Fix |
 | --- | --- |
 | Photo is sideways | Select it and press **R** (or **Shift+R** for the other way). |
-| Wrong year or tag on a finished photo | Switch the view at the top left from **To do** to **Done**, select it and change it. The file in the sorted folder is updated, and moved if the year changed. |
+| Wrong date, tag or caption on a finished photo | Switch the view at the top left from **To do** to **Done**, select it and change it. The file in the sorted folder is updated, and moved if the year changed. |
 | Want to redo a finished photo | In the **Done** view press **Shift+D** to move it back to the to-do list. |
 | A crop picked up dust or cut a photo in two | Select the bad pieces and press **Del**. Rescan with Auto-crop off, or with more space between the prints. |
 | Can't find untagged photos | Type `untagged` or `no year` in the filter box. |
@@ -85,4 +90,4 @@ The full scan behind every photo is always saved in the `raw` folder, so nothing
 
 **The progress bar just bounces.** The first scan at each resolution has no estimate yet. From the second scan on it shows roughly how far along it is, based on how long the previous one took.
 
-**Photos don't show tags in PhotoPrism.** Make sure PhotoPrism re-indexes the sorted folder (Library → Index). Tags appear as keywords and the year as the date taken.
+**Photos don't show tags in PhotoPrism.** Make sure PhotoPrism re-indexes the sorted folder (Library → Index). Tags appear as keywords, the caption as the description and the date as the date taken.

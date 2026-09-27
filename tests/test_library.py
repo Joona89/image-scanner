@@ -126,3 +126,38 @@ def test_loads_version_1_library(tmp_path):
     (tmp_path / "library.json").write_text(json.dumps({"version": 1, **data}), encoding="utf-8")
     again = Library(tmp_path)
     assert again.photos[p.id].year is None and not again.photos[p.id].done
+
+
+def test_parse_date():
+    from scanner_app.library import parse_date
+    assert parse_date("1985") == (1985, None, None)
+    assert parse_date("1985-06") == (1985, 6, None)
+    assert parse_date("1985-06-14") == (1985, 6, 14)
+    assert parse_date("14.6.1985") == (1985, 6, 14)
+    assert parse_date("6.1985") == (1985, 6, None)
+    assert parse_date("14/6/85") == (1985, 6, 14)
+    assert parse_date("?") == (0, None, None)
+    assert parse_date("31.2.1985") is None
+    assert parse_date("1985-13") is None
+    assert parse_date("june 1985") is None
+
+
+def test_full_date_and_caption_in_sorted_file(tmp_path):
+    lib = Library(tmp_path / "lib", tmp_path / "sorted")
+    (p,) = lib.add_scan(img(), [img()])
+    lib.set_date([p.id], (1985, 6, 14))
+    lib.set_caption([p.id], "  Mummon 60v, Tampere  ")
+    lib.finish([p.id])
+    target = tmp_path / "sorted" / "1985" / f"1985-06-14_{p.id}.jpg"
+    assert target.exists()
+    exif = piexif.load(str(target))
+    assert exif["Exif"][piexif.ExifIFD.DateTimeOriginal] == b"1985:06:14 00:00:00"
+    assert exif["Exif"][piexif.ExifIFD.DateTimeDigitized].startswith(p.created[:4].encode())
+    assert exif["0th"][piexif.ImageIFD.ImageDescription].decode("utf-8") == "Mummon 60v, Tampere"
+    assert "Mummon 60v, Tampere</rdf:li>" in target.read_bytes().decode("utf-8", "ignore")
+
+    # Month-only date: file renamed, old one gone.
+    lib.set_date([p.id], (1985, 6, None))
+    assert not target.exists()
+    assert (tmp_path / "sorted" / "1985" / f"1985-06_{p.id}.jpg").exists()
+    assert Library(tmp_path / "lib", tmp_path / "sorted").photos[p.id].caption == "Mummon 60v, Tampere"

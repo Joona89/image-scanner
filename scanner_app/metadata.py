@@ -6,9 +6,12 @@ several standard fields:
 * XMP ``dc:subject`` (keywords): what PhotoPrism, Lightroom, digiKam and
   most other tools read as tags.
 * XMP ``photoshop:DateCreated`` and EXIF ``DateTimeOriginal``: when the
-  photo was taken. Only the year is known, so the date is 1 January of that
-  year. Without this PhotoPrism would date every photo to the day it was
-  scanned.
+  photo was taken. XMP can say "1985" or "1985-06"; EXIF needs a full date,
+  so missing month/day become 1. Without this PhotoPrism would date every
+  photo to the day it was scanned.
+* XMP ``dc:description`` and EXIF ``ImageDescription``: the caption
+  (PhotoPrism's description).
+* EXIF ``DateTimeDigitized`` and XMP ``xmp:CreateDate``: when it was scanned.
 * EXIF ``XPKeywords``: tags shown in Windows Explorer.
 * EXIF resolution: the scan resolution, so prints come out at the original size.
 """
@@ -24,20 +27,39 @@ import piexif
 XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
 
 
-def _xmp_packet(tags: list[str], year: int | None) -> bytes:
+Date = tuple  # (year, month or None, day or None)
+
+
+def _norm_date(date) -> Date | None:
+    if date is None:
+        return None
+    if isinstance(date, int):
+        return (date, None, None)
+    return tuple(date)
+
+
+def _xmp_packet(tags: list[str], date: Date | None, caption: str, scanned: str | None) -> bytes:
     items = "".join(f"<rdf:li>{escape(t)}</rdf:li>" for t in tags)
     subject = f"<dc:subject><rdf:Bag>{items}</rdf:Bag></dc:subject>" if tags else ""
-    date = ""
-    if year is not None:
-        date = (f"<photoshop:DateCreated>{year:04d}</photoshop:DateCreated>"
-                f"<exif:DateTimeOriginal>{year:04d}-01-01T00:00:00</exif:DateTimeOriginal>")
+    extra = ""
+    if date is not None:
+        y, m, d = date
+        partial = f"{y:04d}" + (f"-{m:02d}" if m else "") + (f"-{d:02d}" if m and d else "")
+        extra += (f"<photoshop:DateCreated>{partial}</photoshop:DateCreated>"
+                  f"<exif:DateTimeOriginal>{y:04d}-{m or 1:02d}-{d or 1:02d}T00:00:00</exif:DateTimeOriginal>")
+    if caption:
+        extra += (f'<dc:description><rdf:Alt><rdf:li xml:lang="x-default">{escape(caption)}</rdf:li>'
+                  "</rdf:Alt></dc:description>")
+    if scanned:
+        extra += f"<xmp:CreateDate>{escape(scanned)}</xmp:CreateDate>"
     xml = (
         '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>'
         '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
         '<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/"'
         ' xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"'
-        ' xmlns:exif="http://ns.adobe.com/exif/1.0/">'
-        f"{subject}{date}</rdf:Description></rdf:RDF></x:xmpmeta>"
+        ' xmlns:exif="http://ns.adobe.com/exif/1.0/"'
+        ' xmlns:xmp="http://ns.adobe.com/xap/1.0/">'
+        f"{subject}{extra}</rdf:Description></rdf:RDF></x:xmpmeta>"
         '<?xpacket end="w"?>'
     )
     return xml.encode("utf-8")
@@ -73,8 +95,13 @@ def _set_xmp(jpeg: bytes, packet: bytes) -> bytes:
     return bytes(out + rest)
 
 
-def write_metadata(jpeg: bytes, tags: list[str], year: int | None, dpi: int | None = None) -> bytes:
-    """Return ``jpeg`` with year, tags and resolution embedded."""
+def write_metadata(jpeg: bytes, tags: list[str], date, dpi: int | None = None,
+                   caption: str = "", scanned: str | None = None) -> bytes:
+    """Return ``jpeg`` with date, tags, caption and resolution embedded.
+
+    ``date`` is a year or a (year, month, day) tuple with month/day
+    optional; ``scanned`` an ISO timestamp of the scan."""
+    date = _norm_date(date)
     try:
         exif = piexif.load(jpeg)
     except Exception:
@@ -85,10 +112,17 @@ def write_metadata(jpeg: bytes, tags: list[str], year: int | None, dpi: int | No
         zeroth[piexif.ImageIFD.XPKeywords] = tuple(";".join(tags).encode("utf-16-le") + b"\x00\x00")
     else:
         zeroth.pop(piexif.ImageIFD.XPKeywords, None)
-    if year is not None:
-        ex[piexif.ExifIFD.DateTimeOriginal] = f"{year:04d}:01:01 00:00:00".encode()
+    if date is not None:
+        y, m, d = date
+        ex[piexif.ExifIFD.DateTimeOriginal] = f"{y:04d}:{m or 1:02d}:{d or 1:02d} 00:00:00".encode()
     else:
         ex.pop(piexif.ExifIFD.DateTimeOriginal, None)
+    if caption:
+        zeroth[piexif.ImageIFD.ImageDescription] = caption.encode("utf-8")
+    else:
+        zeroth.pop(piexif.ImageIFD.ImageDescription, None)
+    if scanned:
+        ex[piexif.ExifIFD.DateTimeDigitized] = scanned.replace("-", ":").replace("T", " ")[:19].encode()
     if dpi:
         zeroth[piexif.ImageIFD.XResolution] = (int(dpi), 1)
         zeroth[piexif.ImageIFD.YResolution] = (int(dpi), 1)
@@ -99,4 +133,4 @@ def write_metadata(jpeg: bytes, tags: list[str], year: int | None, dpi: int | No
 
     buf = io.BytesIO()
     piexif.insert(piexif.dump(exif), jpeg, buf)
-    return _set_xmp(buf.getvalue(), _xmp_packet(tags, year))
+    return _set_xmp(buf.getvalue(), _xmp_packet(tags, date, caption, scanned))

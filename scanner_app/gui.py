@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QComplet
                                QMessageBox, QProgressBar, QPushButton, QSplitter, QToolBar, QVBoxLayout, QWidget)
 
 from .cropping import crop_or_whole
-from .library import Library, parse_year, year_label
+from .library import Library, date_label, parse_date, parse_year
 from .scanner import DemoScanner, Scanner, ScanOptions, WiaScanner, list_wia_scanners
 
 THUMB = 180
@@ -24,7 +24,8 @@ HELP = """<b>Keys</b><br>
 <b>Space</b> or <b>F5</b> &nbsp; scan (keep tagging while it runs)<br>
 <b>1</b>–<b>9</b> &nbsp; toggle quick tag on selected photos<br>
 <b>T</b> &nbsp; type a tag for the selected photos (Enter adds it)<br>
-<b>Y</b> &nbsp; type the year for the selected photos (85 = 1985, ? = unknown)<br>
+<b>Y</b> &nbsp; type the date: 1985, 85, 6.1985, 14.6.1985 or ? for unknown<br>
+<b>C</b> &nbsp; type a caption for the selected photos<br>
 <b>D</b> &nbsp; done: write selected photos to their year folder<br>
 <b>Shift+D</b> &nbsp; move selected photos back to the to-do list<br>
 <b>N</b> &nbsp; select the photos from the latest scan<br>
@@ -119,7 +120,7 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.scanner_combo)
 
         self.dpi_combo = QComboBox()
-        for dpi in (150, 300, 450, 600, 1200):
+        for dpi in (75, 100, 150, 200, 240, 300, 400, 450, 600, 800, 1200, 2400):
             self.dpi_combo.addItem(f"{dpi} dpi", dpi)
         self.dpi_combo.setCurrentIndex(max(0, self.dpi_combo.findData(int(self.settings.value("dpi", 300)))))
         self.dpi_combo.currentIndexChanged.connect(lambda: self.settings.setValue("dpi", self.dpi_combo.currentData()))
@@ -240,7 +241,7 @@ class MainWindow(QMainWindow):
 
         year_row = QHBoxLayout()
         self.year_edit = QLineEdit()
-        self.year_edit.setPlaceholderText("Year (Y), required: 1985, 85 or ? for unknown")
+        self.year_edit.setPlaceholderText("Date (Y), year required: 1985, 6.1985, 14.6.1985 or ?")
         self.year_edit.returnPressed.connect(self._year_entered)
         self.year_completer = QCompleter([])
         self.year_edit.setCompleter(self.year_completer)
@@ -249,6 +250,11 @@ class MainWindow(QMainWindow):
         self.done_button.clicked.connect(self.finish_selected)
         year_row.addWidget(self.done_button)
         rv.addLayout(year_row)
+
+        self.caption_edit = QLineEdit()
+        self.caption_edit.setPlaceholderText("Caption (C), e.g. what is written on the back. Enter to apply")
+        self.caption_edit.returnPressed.connect(self._caption_entered)
+        rv.addWidget(self.caption_edit)
 
         self.tag_edit = QLineEdit()
         self.tag_edit.setPlaceholderText("Add tag to selected (T), Enter to apply, commas for several")
@@ -293,6 +299,7 @@ class MainWindow(QMainWindow):
             sc([str(n)], lambda n=n: self.toggle_quick(n - 1))
         sc(["T"], self._focus_tag_edit)
         sc(["Y"], self._focus_year_edit)
+        sc(["C"], self._focus_caption_edit)
         sc(["D"], self.finish_selected)
         sc(["Shift+D"], self.reopen_selected)
         sc(["N"], self.select_last_scan)
@@ -313,9 +320,11 @@ class MainWindow(QMainWindow):
     def _update_item_text(self, item: QListWidgetItem):
         p = self.library.photos[item.data(ID_ROLE)]
         mark = "✓ " if p.done else ""
-        item.setText(f"{mark}{year_label(p.year)} · {', '.join(p.tags) or '—'}")
+        item.setText(f"{mark}{date_label(*p.date)} · {', '.join(p.tags) or '—'}")
         where = f"\nSaved to {p.exported}" if p.done else "\nTo do"
-        item.setToolTip(f"{p.id}\nYear: {year_label(p.year)}\nTags: {', '.join(p.tags) or 'none'}{where}")
+        caption = f"\nCaption: {p.caption}" if p.caption else ""
+        item.setToolTip(f"{p.id}\nDate: {date_label(*p.date)}\nTags: {', '.join(p.tags) or 'none'}"
+                        f"{caption}{where}")
 
     def _reload_grid(self):
         self.grid.clear()
@@ -343,7 +352,8 @@ class MainWindow(QMainWindow):
             elif text == "no year":
                 hide = p.year is not None
             else:
-                hide = not (any(text in t.lower() for t in p.tags) or text in year_label(p.year).lower())
+                hide = not (any(text in t.lower() for t in p.tags) or text in date_label(*p.date).lower()
+                            or text in p.caption.lower())
             it.setHidden(hide)
             if hide and it.isSelected():
                 it.setSelected(False)
@@ -354,8 +364,21 @@ class MainWindow(QMainWindow):
     def _selection_changed(self):
         ids = self.selected_ids()
         self.sel_label.setText(f"{len(ids)} selected" if ids else "Nothing selected")
+        self._fill_fields(ids)
         self._refresh_quick_states()
         self._show_preview()
+
+    def _fill_fields(self, ids):
+        """Show the selection's shared date and caption; blank when they differ.
+        Fields being typed in are left alone."""
+        photos = [self.library.photos[i] for i in ids]
+        dates = {p.date for p in photos}
+        captions = {p.caption for p in photos}
+        if not self.year_edit.hasFocus():
+            d = next(iter(dates)) if len(dates) == 1 else (None, None, None)
+            self.year_edit.setText("" if d[0] is None else ("?" if d[0] == 0 else date_label(*d)))
+        if not self.caption_edit.hasFocus():
+            self.caption_edit.setText(next(iter(captions)) if len(captions) == 1 else "")
 
     def _show_preview(self):
         cur = self.grid.currentItem()
@@ -363,7 +386,10 @@ class MainWindow(QMainWindow):
             self.preview.setPixmap(QPixmap())
             self.preview.setText("No photo selected")
             return
-        pm = QPixmap(str(self.library.path(cur.data(ID_ROLE))))
+        # QImageReader, not QPixmap(path): QPixmap caches by file name and
+        # would keep showing the photo as it was before rotating.
+        reader = QImageReader(str(self.library.path(cur.data(ID_ROLE))))
+        pm = QPixmap.fromImage(reader.read())
         self.preview.setPixmap(pm.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def resizeEvent(self, e):
@@ -451,18 +477,45 @@ class MainWindow(QMainWindow):
         if not text.strip():
             self.grid.setFocus()
             return
-        year = parse_year(text)
-        if year is None:
-            self.statusBar().showMessage(f"'{text}' is not a year. Use e.g. 1985, 85, or ? for unknown.", 5000)
+        if not self._apply_date(ids):
             return
-        self.year_edit.clear()
+        self.grid.setFocus()
+
+    def _apply_date(self, ids) -> bool:
+        """Apply the date field to ``ids``. False if the text is not a date."""
+        text = self.year_edit.text()
+        date = parse_date(text)
+        if date is None:
+            self.statusBar().showMessage(
+                f"'{text}' is not a date. Use e.g. 1985, 85, 6.1985, 14.6.1985 or ? for unknown.", 6000)
+            self.year_edit.setFocus()
+            return False
+        self.year_edit.setModified(False)
         if not ids:
             self.statusBar().showMessage("Select photos first.", 3000)
-        else:
-            self.library.set_year(ids, year)
-            self.statusBar().showMessage(f"Year {year_label(year)} on {len(ids)} photo(s). Press D when done.", 4000)
-            self._after_tag_change(ids)
+            return True
+        self.library.set_date(ids, date)
+        self.statusBar().showMessage(f"{date_label(*date)} on {len(ids)} photo(s). Press D when done.", 4000)
+        self._after_tag_change(ids)
+        return True
+
+    def _caption_entered(self):
+        ids = self.selected_ids()
+        if not ids:
+            self.statusBar().showMessage("Select photos first.", 3000)
+            return
+        self._apply_caption(ids)
         self.grid.setFocus()
+
+    def _apply_caption(self, ids):
+        self.caption_edit.setModified(False)
+        self.library.set_caption(ids, self.caption_edit.text())
+        self.statusBar().showMessage(f"Caption saved on {len(ids)} photo(s).", 3000)
+        self._after_tag_change(ids)
+
+    def _focus_caption_edit(self):
+        self.caption_edit.setFocus()
+        self.caption_edit.selectAll()
 
     def _focus_year_edit(self):
         self.year_edit.setFocus()
@@ -472,6 +525,12 @@ class MainWindow(QMainWindow):
         ids = self.selected_ids()
         if not ids:
             return
+        # A date or caption typed but not confirmed with Enter still counts.
+        if self.year_edit.isModified() and self.year_edit.text().strip():
+            if not self._apply_date(ids):
+                return
+        if self.caption_edit.isModified():
+            self._apply_caption(ids)
         done, missing = self.library.finish(ids)
         self._after_tag_change(ids)
         if missing:
@@ -498,7 +557,7 @@ class MainWindow(QMainWindow):
         self.tag_edit.selectAll()
 
     def _escape(self):
-        if self.tag_edit.hasFocus() or self.filter_edit.hasFocus() or self.year_edit.hasFocus():
+        if any(w.hasFocus() for w in (self.tag_edit, self.filter_edit, self.year_edit, self.caption_edit)):
             self.grid.setFocus()
         else:
             self.grid.clearSelection()
@@ -527,6 +586,10 @@ class MainWindow(QMainWindow):
         self.library.rotate(ids, clockwise)
         for it in self.grid.selectedItems():
             it.setIcon(QIcon(load_thumb(self.library.path(it.data(ID_ROLE)))))
+        # Portrait and landscape thumbnails differ in size: re-lay out the grid
+        # so the old thumbnail's area is repainted.
+        self.grid.doItemsLayout()
+        self.grid.viewport().update()
         self._show_preview()
 
     def delete_selected(self):
