@@ -66,3 +66,63 @@ def test_rotate_and_delete(tmp_path):
     lib.delete([p.id])
     assert not (tmp_path / p.file).exists()
     assert Library(tmp_path).photos == {}
+
+
+def test_parse_year():
+    from scanner_app.library import parse_year
+    assert parse_year("1985") == 1985
+    assert parse_year(" 85 ") == 1985
+    assert parse_year("?") == 0
+    assert parse_year("198") is None
+    assert parse_year("abcd") is None
+    assert parse_year("3000") is None
+
+
+def test_done_needs_year_and_writes_year_folder(tmp_path):
+    lib = Library(tmp_path / "lib", tmp_path / "sorted")
+    a, b, c = (p.id for p in lib.add_scan(img(), [img(), img(), img()], tags=["Mummo"]))
+    lib.set_year([a], 1985)
+    lib.set_year([b], 0)
+    done, missing = lib.finish([a, b, c])
+    assert done == [a, b] and missing == [c]
+    assert [p.id for p in lib.todo()] == [c]
+
+    target = tmp_path / "sorted" / "1985" / f"1985_{a}.jpg"
+    assert target.exists()
+    assert (tmp_path / "sorted" / "Unknown year" / f"{b}.jpg").exists()
+    exif = piexif.load(str(target))
+    assert exif["Exif"][piexif.ExifIFD.DateTimeOriginal] == b"1985:01:01 00:00:00"
+    assert b"<rdf:li>Mummo</rdf:li>" in target.read_bytes()
+
+
+def test_editing_done_photo_updates_sorted_copy(tmp_path):
+    lib = Library(tmp_path / "lib", tmp_path / "sorted")
+    (p,) = lib.add_scan(img(), [img()], year=1985)
+    lib.finish([p.id])
+    old = tmp_path / "sorted" / "1985" / f"1985_{p.id}.jpg"
+
+    lib.add_tag([p.id], "beach")
+    assert b"<rdf:li>beach</rdf:li>" in old.read_bytes()
+
+    lib.set_year([p.id], 1986)
+    new = tmp_path / "sorted" / "1986" / f"1986_{p.id}.jpg"
+    assert new.exists() and not old.exists()
+
+    lib.reopen([p.id])
+    assert not new.exists() and not lib.photos[p.id].done
+
+    lib.finish([p.id])
+    lib.delete([p.id])
+    assert not new.exists()
+
+
+def test_loads_version_1_library(tmp_path):
+    lib = Library(tmp_path)
+    (p,) = lib.add_scan(img(), [img()])
+    data = json.loads((tmp_path / "library.json").read_text(encoding="utf-8"))
+    for d in data["photos"]:
+        for k in ("year", "dpi", "exported"):
+            d.pop(k)
+    (tmp_path / "library.json").write_text(json.dumps({"version": 1, **data}), encoding="utf-8")
+    again = Library(tmp_path)
+    assert again.photos[p.id].year is None and not again.photos[p.id].done

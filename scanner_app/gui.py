@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import time
 import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QItemSelectionModel, QObject, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QIcon, QImageReader, QKeySequence, QPixmap, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QCompleter, QFileDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QCompleter, QFileDialog, QHBoxLayout,
                                QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow,
-                               QMessageBox, QSplitter, QToolBar, QVBoxLayout, QWidget)
+                               QMessageBox, QProgressBar, QPushButton, QSplitter, QToolBar, QVBoxLayout, QWidget)
 
 from .cropping import crop_or_whole
-from .library import Library
+from .library import Library, parse_year, year_label
 from .scanner import DemoScanner, Scanner, ScanOptions, WiaScanner, list_wia_scanners
 
 THUMB = 180
@@ -23,6 +24,9 @@ HELP = """<b>Keys</b><br>
 <b>Space</b> or <b>F5</b> &nbsp; scan (keep tagging while it runs)<br>
 <b>1</b>–<b>9</b> &nbsp; toggle quick tag on selected photos<br>
 <b>T</b> &nbsp; type a tag for the selected photos (Enter adds it)<br>
+<b>Y</b> &nbsp; type the year for the selected photos (85 = 1985, ? = unknown)<br>
+<b>D</b> &nbsp; done: write selected photos to their year folder<br>
+<b>Shift+D</b> &nbsp; move selected photos back to the to-do list<br>
 <b>N</b> &nbsp; select the photos from the latest scan<br>
 <b>Ctrl+A</b> / <b>Esc</b> &nbsp; select all / none<br>
 <b>R</b> / <b>Shift+R</b> &nbsp; rotate right / left<br>
@@ -39,19 +43,25 @@ class ScanWorker(QObject):
 
     done = Signal(list)       # new Photo objects
     failed = Signal(str)
+    progress = Signal(float)  # 0..1, only from scanners that report it
+    scanned = Signal(float)   # seconds the scanner took
+    stage = Signal(str)
 
     def __init__(self, scanner: Scanner, library: Library, options: ScanOptions,
-                 auto_crop: bool, tags: list[str]):
+                 auto_crop: bool, tags: list[str], year: int | None):
         super().__init__()
         self.scanner, self.library, self.options = scanner, library, options
-        self.auto_crop, self.tags = auto_crop, tags
+        self.auto_crop, self.tags, self.year = auto_crop, tags, year
 
     @Slot()
     def run(self):
         try:
-            scan = self.scanner.scan(self.options)
+            t0 = time.monotonic()
+            scan = self.scanner.scan(self.options, self.progress.emit)
+            self.scanned.emit(time.monotonic() - t0)
+            self.stage.emit("Cutting out photos…")
             crops = crop_or_whole(scan) if self.auto_crop else [scan]
-            self.done.emit(self.library.add_scan(scan, crops, self.tags))
+            self.done.emit(self.library.add_scan(scan, crops, self.tags, self.year, self.options.dpi))
         except Exception as e:
             traceback.print_exc()
             self.failed.emit(str(e) or type(e).__name__)
@@ -75,6 +85,11 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker: ScanWorker | None = None
         self._last_scan_ids: list[str] = []
+        self._scan_started = 0.0
+        self._expected_seconds: float | None = None
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(200)
+        self._progress_timer.timeout.connect(self._estimate_progress)
         self.setWindowTitle("Image Scanner")
         self.resize(1300, 850)
 
@@ -104,7 +119,7 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.scanner_combo)
 
         self.dpi_combo = QComboBox()
-        for dpi in (150, 300, 600, 1200):
+        for dpi in (150, 300, 450, 600, 1200):
             self.dpi_combo.addItem(f"{dpi} dpi", dpi)
         self.dpi_combo.setCurrentIndex(max(0, self.dpi_combo.findData(int(self.settings.value("dpi", 300)))))
         self.dpi_combo.currentIndexChanged.connect(lambda: self.settings.setValue("dpi", self.dpi_combo.currentData()))
@@ -120,7 +135,18 @@ class MainWindow(QMainWindow):
         self.crop_check.setChecked(self.settings.value("auto_crop", True, bool))
         self.crop_check.toggled.connect(lambda v: self.settings.setValue("auto_crop", v))
         tb.addWidget(self.crop_check)
-        tb.addSeparator()
+
+        # Second row: what new scans get, and where photos go.
+        self.addToolBarBreak()
+        tb = QToolBar("Output")
+        tb.setMovable(False)
+        self.addToolBar(tb)
+        tb.addWidget(QLabel(" Year for new scans "))
+        self.new_year_edit = QLineEdit(self.settings.value("new_scan_year", ""))
+        self.new_year_edit.setPlaceholderText("optional")
+        self.new_year_edit.setMaximumWidth(80)
+        self.new_year_edit.textChanged.connect(lambda t: self.settings.setValue("new_scan_year", t))
+        tb.addWidget(self.new_year_edit)
 
         tb.addWidget(QLabel(" Tags for new scans "))
         self.new_tags_edit = QLineEdit(self.settings.value("new_scan_tags", ""))
@@ -130,11 +156,16 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.new_tags_edit)
         tb.addSeparator()
 
-        folder_action = QAction("Output folder…", self)
+        folder_action = QAction("Scan folder…", self)
+        folder_action.setToolTip("Where raw scans and the to-do list are kept")
         folder_action.triggered.connect(self.choose_folder)
         tb.addAction(folder_action)
-        open_action = QAction("Open folder", self)
-        open_action.triggered.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.library.folder))))
+        sorted_action = QAction("Sorted folder…", self)
+        sorted_action.setToolTip("Where finished photos are written, one folder per year")
+        sorted_action.triggered.connect(self.choose_sorted_folder)
+        tb.addAction(sorted_action)
+        open_action = QAction("Open sorted", self)
+        open_action.triggered.connect(self._open_sorted)
         tb.addAction(open_action)
 
     def _fill_scanners(self):
@@ -168,10 +199,18 @@ class MainWindow(QMainWindow):
         left = QWidget()
         lv = QVBoxLayout(left)
         lv.setContentsMargins(4, 4, 4, 4)
+        top = QHBoxLayout()
+        self.view_combo = QComboBox()
+        self.view_combo.addItem("To do", "todo")
+        self.view_combo.addItem("Done", "done")
+        self.view_combo.addItem("All", "all")
+        self.view_combo.currentIndexChanged.connect(self._apply_filter)
+        top.addWidget(self.view_combo)
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("Filter by tag…  (type 'untagged' to find photos without tags)")
+        self.filter_edit.setPlaceholderText("Filter by tag or year…  ('untagged' or 'no year' also work)")
         self.filter_edit.textChanged.connect(self._apply_filter)
-        lv.addWidget(self.filter_edit)
+        top.addWidget(self.filter_edit, 1)
+        lv.addLayout(top)
 
         self.grid = QListWidget()
         self.grid.setViewMode(QListView.IconMode)
@@ -198,6 +237,18 @@ class MainWindow(QMainWindow):
 
         self.sel_label = QLabel()
         rv.addWidget(self.sel_label)
+
+        year_row = QHBoxLayout()
+        self.year_edit = QLineEdit()
+        self.year_edit.setPlaceholderText("Year (Y), required: 1985, 85 or ? for unknown")
+        self.year_edit.returnPressed.connect(self._year_entered)
+        self.year_completer = QCompleter([])
+        self.year_edit.setCompleter(self.year_completer)
+        year_row.addWidget(self.year_edit, 1)
+        self.done_button = QPushButton("Done → year folder (D)")
+        self.done_button.clicked.connect(self.finish_selected)
+        year_row.addWidget(self.done_button)
+        rv.addLayout(year_row)
 
         self.tag_edit = QLineEdit()
         self.tag_edit.setPlaceholderText("Add tag to selected (T), Enter to apply, commas for several")
@@ -241,6 +292,9 @@ class MainWindow(QMainWindow):
         for n in range(1, 10):
             sc([str(n)], lambda n=n: self.toggle_quick(n - 1))
         sc(["T"], self._focus_tag_edit)
+        sc(["Y"], self._focus_year_edit)
+        sc(["D"], self.finish_selected)
+        sc(["Shift+D"], self.reopen_selected)
         sc(["N"], self.select_last_scan)
         sc(["Esc"], self._escape)
         sc(["R"], lambda: self.rotate(True))
@@ -258,8 +312,10 @@ class MainWindow(QMainWindow):
 
     def _update_item_text(self, item: QListWidgetItem):
         p = self.library.photos[item.data(ID_ROLE)]
-        item.setText(", ".join(p.tags) if p.tags else "—")
-        item.setToolTip(f"{p.id}\n{', '.join(p.tags) or 'no tags'}")
+        mark = "✓ " if p.done else ""
+        item.setText(f"{mark}{year_label(p.year)} · {', '.join(p.tags) or '—'}")
+        where = f"\nSaved to {p.exported}" if p.done else "\nTo do"
+        item.setToolTip(f"{p.id}\nYear: {year_label(p.year)}\nTags: {', '.join(p.tags) or 'none'}{where}")
 
     def _reload_grid(self):
         self.grid.clear()
@@ -275,15 +331,25 @@ class MainWindow(QMainWindow):
 
     def _apply_filter(self):
         text = self.filter_edit.text().strip().lower()
+        view = self.view_combo.currentData()
         for it in self._items():
-            tags = self.library.photos[it.data(ID_ROLE)].tags
-            if not text:
+            p = self.library.photos[it.data(ID_ROLE)]
+            if (view == "todo" and p.done) or (view == "done" and not p.done):
+                hide = True
+            elif not text:
                 hide = False
             elif text == "untagged":
-                hide = bool(tags)
+                hide = bool(p.tags)
+            elif text == "no year":
+                hide = p.year is not None
             else:
-                hide = not any(text in t.lower() for t in tags)
+                hide = not (any(text in t.lower() for t in p.tags) or text in year_label(p.year).lower())
             it.setHidden(hide)
+            if hide and it.isSelected():
+                it.setSelected(False)
+        todo = sum(not p.done for p in self.library.photos.values())
+        self.view_combo.setItemText(0, f"To do ({todo})")
+        self.view_combo.setItemText(1, f"Done ({len(self.library.photos) - todo})")
 
     def _selection_changed(self):
         ids = self.selected_ids()
@@ -312,6 +378,7 @@ class MainWindow(QMainWindow):
     def _refresh_tags(self):
         known = set(self.quick_tags)
         self.completer.model().setStringList(sorted(set(self.library.all_tags()) | known, key=str.lower))
+        self.year_completer.model().setStringList([str(y) for y in self.library.all_years()])
         self.quick_list.clear()
         for i, t in enumerate(self.quick_tags):
             label = f"{i + 1}  {t}" if i < 9 else f"    {t}"
@@ -378,12 +445,60 @@ class MainWindow(QMainWindow):
             self.settings.setValue("quick_tags", self.quick_tags)
             self._refresh_tags()
 
+    def _year_entered(self):
+        text = self.year_edit.text()
+        ids = self.selected_ids()
+        if not text.strip():
+            self.grid.setFocus()
+            return
+        year = parse_year(text)
+        if year is None:
+            self.statusBar().showMessage(f"'{text}' is not a year. Use e.g. 1985, 85, or ? for unknown.", 5000)
+            return
+        self.year_edit.clear()
+        if not ids:
+            self.statusBar().showMessage("Select photos first.", 3000)
+        else:
+            self.library.set_year(ids, year)
+            self.statusBar().showMessage(f"Year {year_label(year)} on {len(ids)} photo(s). Press D when done.", 4000)
+            self._after_tag_change(ids)
+        self.grid.setFocus()
+
+    def _focus_year_edit(self):
+        self.year_edit.setFocus()
+        self.year_edit.selectAll()
+
+    def finish_selected(self):
+        ids = self.selected_ids()
+        if not ids:
+            return
+        done, missing = self.library.finish(ids)
+        self._after_tag_change(ids)
+        if missing:
+            # Keep the ones that still need a year selected, ready for Y.
+            for it in self._items():
+                it.setSelected(it.data(ID_ROLE) in missing)
+            self.statusBar().showMessage(
+                f"{len(done)} photo(s) saved. {len(missing)} still need a year: press Y to set it.", 6000)
+        else:
+            self.statusBar().showMessage(f"{len(done)} photo(s) saved to {self.library.sorted_folder}", 4000)
+        self._update_status()
+
+    def reopen_selected(self):
+        ids = [i for i in self.selected_ids() if self.library.photos[i].done]
+        if not ids:
+            return
+        self.library.reopen(ids)
+        self._after_tag_change(ids)
+        self.statusBar().showMessage(f"{len(ids)} photo(s) moved back to the to-do list.", 4000)
+        self._update_status()
+
     def _focus_tag_edit(self):
         self.tag_edit.setFocus()
         self.tag_edit.selectAll()
 
     def _escape(self):
-        if self.tag_edit.hasFocus() or self.filter_edit.hasFocus():
+        if self.tag_edit.hasFocus() or self.filter_edit.hasFocus() or self.year_edit.hasFocus():
             self.grid.setFocus()
         else:
             self.grid.clearSelection()
@@ -431,12 +546,26 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Where should scans be saved?", str(self.library.folder))
         if not folder or self.is_scanning():
             return
-        self.library = Library(folder)
+        self.library = Library(folder, self.settings.value("sorted_folder") or None)
         self.settings.setValue("output_folder", folder)
         self._last_scan_ids = []
         self._reload_grid()
         self._refresh_tags()
         self._update_status()
+
+    def choose_sorted_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Where should finished photos go (one folder per year)?",
+                                                  str(self.library.sorted_folder))
+        if not folder:
+            return
+        self.library.sorted_folder = Path(folder)
+        self.settings.setValue("sorted_folder", folder)
+        self._update_status()
+        self.statusBar().showMessage("Photos marked done from now on go to the new folder.", 5000)
+
+    def _open_sorted(self):
+        self.library.sorted_folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.library.sorted_folder)))
 
     # ------------------------------------------------------------ scans
 
@@ -452,13 +581,22 @@ class MainWindow(QMainWindow):
             return
         options = ScanOptions(dpi=self.dpi_combo.currentData(), color=self.color_check.isChecked())
         tags = split_tags(self.new_tags_edit.text())
+        year = None
+        if self.new_year_edit.text().strip():
+            year = parse_year(self.new_year_edit.text())
+            if year is None:
+                QMessageBox.warning(self, "Year for new scans", "That is not a year. Use e.g. 1985 or leave it empty.")
+                return
         for t in tags:
             self._remember_tag(t)
 
         self._thread = QThread(self)
-        self._worker = ScanWorker(self.scanner, self.library, options, self.crop_check.isChecked(), tags)
+        self._worker = ScanWorker(self.scanner, self.library, options, self.crop_check.isChecked(), tags, year)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._real_progress)
+        self._worker.scanned.connect(self._remember_scan_time)
+        self._worker.stage.connect(self._scan_stage)
         self._worker.done.connect(self._scan_done)
         self._worker.failed.connect(self._scan_failed)
         self._worker.done.connect(self._thread.quit)
@@ -466,8 +604,51 @@ class MainWindow(QMainWindow):
         self._thread.finished.connect(self._scan_thread_finished)
         self.scan_action.setEnabled(False)
         self.scan_action.setText("Scanning…")
+        self._start_progress(options)
         self._update_status()
         self._thread.start()
+
+    # Progress: real values when the scanner reports them, otherwise an
+    # estimate from how long the last scan with the same settings took.
+
+    def _timing_key(self, options: ScanOptions) -> str:
+        return f"scan_seconds/{self.scanner.name}/{options.dpi}/{'color' if options.color else 'gray'}"
+
+    def _start_progress(self, options: ScanOptions):
+        self._scan_started = time.monotonic()
+        self._timing = self._timing_key(options)
+        self.progress_bar.show()
+        self.progress_bar.setValue(0)
+        if self.scanner.reports_progress:
+            self._expected_seconds = None
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setFormat("Scanning %p%")
+            return
+        expected = self.settings.value(self._timing, None)
+        self._expected_seconds = float(expected) if expected else None
+        if self._expected_seconds:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setFormat("Scanning ~%p% (estimate)")
+            self._progress_timer.start()
+        else:
+            self.progress_bar.setRange(0, 0)  # busy animation until we know how long it takes
+            self.progress_bar.setFormat("Scanning…")
+
+    def _estimate_progress(self):
+        elapsed = time.monotonic() - self._scan_started
+        self.progress_bar.setValue(int(min(0.97, elapsed / self._expected_seconds) * 100))
+
+    def _real_progress(self, fraction: float):
+        self.progress_bar.setValue(int(fraction * 100))
+
+    def _remember_scan_time(self, seconds: float):
+        self.settings.setValue(self._timing, max(0.1, round(seconds, 1)))
+        self._progress_timer.stop()
+
+    def _scan_stage(self, text: str):
+        self._progress_timer.stop()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat(text)
 
     def _scan_thread_finished(self):
         self._thread.deleteLater()
@@ -475,6 +656,8 @@ class MainWindow(QMainWindow):
         self._thread = self._worker = None
         self.scan_action.setEnabled(True)
         self.scan_action.setText("Scan (Space)")
+        self._progress_timer.stop()
+        self.progress_bar.hide()
         self._update_status()
 
     def _scan_done(self, photos):
@@ -496,11 +679,18 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Scan failed", message)
 
     def _update_status(self):
-        state = "Scanning… you can keep tagging" if self.is_scanning() else "Ready"
-        self.status_label = getattr(self, "status_label", None) or QLabel()
-        if self.status_label.parent() is None:
+        if getattr(self, "status_label", None) is None:
+            self.progress_bar = QProgressBar()
+            self.progress_bar.setMaximumWidth(260)
+            self.progress_bar.setTextVisible(True)
+            self.progress_bar.hide()
+            self.status_label = QLabel()
+            self.statusBar().addPermanentWidget(self.progress_bar)
             self.statusBar().addPermanentWidget(self.status_label)
-        self.status_label.setText(f"{state}  |  {len(self.library.photos)} photos  |  {self.library.folder}")
+        todo = sum(not p.done for p in self.library.photos.values())
+        state = "Scanning, keep tagging" if self.is_scanning() else "Ready"
+        self.status_label.setText(f"{state}  |  {todo} to do, {len(self.library.photos) - todo} done"
+                                  f"  |  sorted into {self.library.sorted_folder}")
 
     def closeEvent(self, e):
         if self.is_scanning():

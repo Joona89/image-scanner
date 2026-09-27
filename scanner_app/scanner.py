@@ -18,6 +18,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -35,11 +36,17 @@ class ScanOptions:
     color: bool = True
 
 
+ProgressFn = Callable[[float], None]
+
+
 class Scanner:
     name = "scanner"
+    # True when scan() calls ``progress`` with real values. Otherwise the
+    # app shows an estimate based on earlier scans.
+    reports_progress = False
 
-    def scan(self, options: ScanOptions) -> np.ndarray:
-        """Scan one page and return it as a BGR image."""
+    def scan(self, options: ScanOptions, progress: ProgressFn | None = None) -> np.ndarray:
+        """Scan one page at ``options.dpi`` and return it as a BGR image."""
         raise NotImplementedError
 
 
@@ -79,6 +86,40 @@ def _set_prop(props, prop_id: int, value) -> bool:
         return True
     except Exception:  # driver rejected the value; keep its default
         return False
+
+
+def pick_resolution(prop, wanted: int) -> int:
+    """The resolution to ask the driver for: ``wanted`` if supported, else the
+    next higher supported value (the image is then scaled down), else the
+    highest available."""
+    if prop is None:
+        return wanted
+    try:
+        sub = prop.SubType
+        if sub == 2:  # list of values
+            vec = prop.SubTypeValues  # WIA Vector, 1-based
+            values = sorted(int(vec.Item(i)) for i in range(1, vec.Count + 1))
+        elif sub == 1:  # range
+            lo, hi, step = int(prop.SubTypeMin), int(prop.SubTypeMax), max(1, int(prop.SubTypeStep))
+            if lo <= wanted <= hi and (wanted - lo) % step == 0:
+                return wanted
+            values = list(range(lo, hi + 1, step))
+        else:
+            return wanted
+    except Exception:
+        return wanted
+    if wanted in values:
+        return wanted
+    higher = [v for v in values if v > wanted]
+    return higher[0] if higher else values[-1]
+
+
+def resample(img: np.ndarray, from_dpi: int, to_dpi: int) -> np.ndarray:
+    if from_dpi == to_dpi:
+        return img
+    f = to_dpi / from_dpi
+    interp = cv2.INTER_AREA if f < 1 else cv2.INTER_CUBIC
+    return cv2.resize(img, None, fx=f, fy=f, interpolation=interp)
 
 
 def list_wia_scanners() -> list[tuple[str, str]]:
@@ -122,7 +163,9 @@ class WiaScanner(Scanner):
         raise ScanError("No scanner found. Check that it is switched on and "
                         "shows up in Windows 'Printers & scanners'.")
 
-    def scan(self, options: ScanOptions) -> np.ndarray:
+    def scan(self, options: ScanOptions, progress: ProgressFn | None = None) -> np.ndarray:
+        # WIA automation's Transfer() blocks without progress callbacks, so
+        # the app estimates progress from earlier scans (reports_progress=False).
         import pythoncom
 
         pythoncom.CoInitialize()
@@ -132,16 +175,19 @@ class WiaScanner(Scanner):
             props = item.Properties
             _set_prop(props, WIA_IPS_CUR_INTENT, 1 if options.color else 2)
             _set_prop(props, WIA_IPA_DATATYPE, 3 if options.color else 2)
-            _set_prop(props, WIA_IPS_XRES, options.dpi)
-            _set_prop(props, WIA_IPS_YRES, options.dpi)
+            # Not every driver offers every resolution (450 is often missing):
+            # scan at the next one up and scale down afterwards.
+            dpi = pick_resolution(_prop(props, WIA_IPS_XRES), options.dpi)
+            if not (_set_prop(props, WIA_IPS_XRES, dpi) and _set_prop(props, WIA_IPS_YRES, dpi)):
+                raise ScanError(f"The scanner does not accept {dpi} dpi.")
             # Scan the whole bed: several photos are usually laid out on it.
             bed_w = _prop(device.Properties, WIA_DPS_HORIZONTAL_BED_SIZE)
             bed_h = _prop(device.Properties, WIA_DPS_VERTICAL_BED_SIZE)
             _set_prop(props, WIA_IPS_XPOS, 0)
             _set_prop(props, WIA_IPS_YPOS, 0)
             if bed_w is not None and bed_h is not None:
-                _set_prop(props, WIA_IPS_XEXTENT, int(bed_w.Value * options.dpi / 1000))
-                _set_prop(props, WIA_IPS_YEXTENT, int(bed_h.Value * options.dpi / 1000))
+                _set_prop(props, WIA_IPS_XEXTENT, int(bed_w.Value * dpi / 1000))
+                _set_prop(props, WIA_IPS_YEXTENT, int(bed_h.Value * dpi / 1000))
 
             try:
                 wia_image = item.Transfer(WIA_FORMAT_PNG)
@@ -159,7 +205,7 @@ class WiaScanner(Scanner):
                     os.remove(tmp)
             if img is None:
                 raise ScanError("Scanner returned an unreadable image.")
-            return img
+            return resample(img, dpi, options.dpi)
         finally:
             pythoncom.CoUninitialize()
 
@@ -179,7 +225,7 @@ class FolderScanner(Scanner):
         self._files = itertools.cycle(files)
         self.name = f"Folder: {Path(folder).name}"
 
-    def scan(self, options: ScanOptions) -> np.ndarray:
+    def scan(self, options: ScanOptions, progress: ProgressFn | None = None) -> np.ndarray:
         path = next(self._files)
         img = cv2.imdecode(np.fromfile(str(path), np.uint8), cv2.IMREAD_COLOR)
         if img is None:
@@ -197,11 +243,17 @@ class DemoScanner(Scanner):
         self.delay = delay
         self._n = 0
 
-    def scan(self, options: ScanOptions) -> np.ndarray:
+    reports_progress = True
+
+    def scan(self, options: ScanOptions, progress: ProgressFn | None = None) -> np.ndarray:
         layout = DEMO_LAYOUTS[self._n % len(DEMO_LAYOUTS)]
         img = make_scan(layout, seed=self._n)
         self._n += 1
-        time.sleep(self.delay)
+        steps = 20
+        for i in range(1, steps + 1):
+            time.sleep(self.delay / steps)
+            if progress:
+                progress(i / steps)
         return img if options.color else cv2.cvtColor(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
 
 
