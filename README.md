@@ -1,3 +1,7 @@
+# Disclaimer
+
+Fully done with Claude Opus 5.5
+
 # Image Scanner
 
 **Digitise a box of old photo prints in an evening.** Lay a few prints on the scanner, press Space, and the app cuts out every photo, straightens it and lines it up for you to tag. While the next scan runs you give the last batch a year and a few tags, press D, and they land in a folder per year with the tags built into the files, ready for PhotoPrism or any other photo library.
